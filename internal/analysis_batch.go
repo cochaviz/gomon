@@ -207,9 +207,22 @@ func (config *AnalysisConfiguration) ProcessBatch(
 		config.captureRecentPackets(batch)
 	}
 
-	globalPacketCount, localPacketCounts, err := countPacketsByHost(&batch, &config.context.uninterestingIPs, 512)
+	const maxTrackedHosts = 512
+	globalPacketCount, localPacketCounts, err := countPacketsByHost(
+		&batch,
+		&config.context.uninterestingIPs,
+		maxTrackedHosts,
+	)
 	if err != nil {
-		config.logger.Error("Error counting packet totals", "error", err)
+		var maxErr *MaxHostsReached
+		if errors.As(err, &maxErr) {
+			config.logger.Warn(
+				"Maximum number of hosts reached; continuing with partial counts",
+				"limit", maxTrackedHosts,
+			)
+		} else {
+			config.logger.Error("Error counting packet totals", "error", err)
+		}
 	}
 
 	// Save intermediate results; normalization happens when the window flushes.
