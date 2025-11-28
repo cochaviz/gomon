@@ -196,6 +196,68 @@ type Behavior struct {
 	Destination *Destination `json:"destination,omitempty"`
 }
 
+// NewBehavior builds a Behavior with consistent context and destination wiring.
+func NewBehavior(
+	classification BehaviorClass,
+	scope BehaviorScope,
+	eventTime time.Time,
+	packetRate float64,
+	packetThreshold float64,
+	ipRate float64,
+	ipRateThreshold float64,
+	destination *Destination,
+	destinationLabels *[]string,
+	context *AnalysisContext,
+) *Behavior {
+	if eventTime.IsZero() {
+		eventTime = time.Now()
+	}
+
+	b := &Behavior{
+		Classification:  classification,
+		Scope:           scope,
+		Timestamp:       eventTime,
+		PacketRate:      packetRate,
+		PacketThreshold: packetThreshold,
+		IPRate:          ipRate,
+		IPRateThreshold: ipRateThreshold,
+	}
+
+	if context != nil {
+		if context.sampleID != "" {
+			b.SampleID = context.sampleID
+		}
+		if context.srcIP != "" {
+			b.SrcIP = &context.srcIP
+		}
+		if context.c2IP != "" {
+			b.C2IP = &context.c2IP
+		}
+	}
+
+	if destination != nil {
+		destCopy := *destination
+		if destCopy.IP != "" {
+			dstIP := destCopy.IP
+			b.DstIP = &dstIP
+		}
+		if destCopy.Port > 0 {
+			port := destCopy.Port
+			b.DstPort = &port
+		}
+		if destCopy.Protocol != "" {
+			b.Proto = destCopy.Protocol
+		}
+		b.Destination = &destCopy
+	}
+
+	if destinationLabels != nil {
+		b.DstIPs = destinationLabels
+	}
+
+	return b
+}
+
 // ProcessBatch processes a (subset) of a window of packets and saves
 // intermediate results.
 func (config *AnalysisConfiguration) ProcessBatch(
@@ -473,11 +535,6 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 	globalBehavior *Behavior,
 ) *Behavior {
 	destCopy := destination // avoid referencing loop variable
-	var dstPort *uint16
-	if destCopy.Port > 0 {
-		port := destCopy.Port
-		dstPort = &port
-	}
 
 	config.logger.Debug(
 		"Classifying local behavior",
@@ -489,44 +546,36 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 
 	// attacks can only occur if a C2 IP is specified (assumed)
 	if config.context.c2IP != "" && packetRate > config.PacketRateThreshold {
-		destIP := destCopy.IP
-		return &Behavior{
-			Classification:  Attack,
-			Scope:           Local,
-			Timestamp:       eventTime,
-			PacketRate:      packetRate,
-			PacketThreshold: config.PacketRateThreshold,
-			IPRate:          0,
-			IPRateThreshold: 0,
-			DstIP:           &destIP,
-			DstPort:         dstPort,
-			Proto:           destCopy.Protocol,
-			Destination:     &destCopy,
-			SrcIP:           &config.context.srcIP,
-			SampleID:        config.context.sampleID,
-		}
+		return NewBehavior(
+			Attack,
+			Local,
+			eventTime,
+			packetRate,
+			config.PacketRateThreshold,
+			0,
+			0,
+			&destCopy,
+			nil,
+			&config.context,
+		)
 	}
 	// if no c2 is specified, or it's a low packet rate, it might be a regular connection
 	// if, however, globally a scan was detected, we cannot determine whether it's part of the scan or not
 	if globalBehavior != nil && globalBehavior.Classification == Scan {
 		return nil
 	}
-	destIP := destCopy.IP
-	return &Behavior{
-		Classification:  OutboundConnection,
-		Scope:           Local,
-		Timestamp:       eventTime,
-		PacketRate:      packetRate,
-		PacketThreshold: config.PacketRateThreshold,
-		IPRate:          0,
-		IPRateThreshold: 0,
-		DstIP:           &destIP,
-		DstPort:         dstPort,
-		Proto:           destCopy.Protocol,
-		Destination:     &destCopy,
-		SrcIP:           &config.context.srcIP,
-		SampleID:        config.context.sampleID,
-	}
+	return NewBehavior(
+		OutboundConnection,
+		Local,
+		eventTime,
+		packetRate,
+		config.PacketRateThreshold,
+		0,
+		0,
+		&destCopy,
+		nil,
+		&config.context,
+	)
 }
 
 func (config *AnalysisConfiguration) classifyGlobalBehavior(
@@ -555,35 +604,33 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 				"threshold", config.IPRateThreshold,
 			)
 
-			return &Behavior{
-				Classification:  Scan,
-				Scope:           Global,
-				Timestamp:       eventTime,
-				PacketRate:      globalPacketRate,
-				PacketThreshold: config.PacketRateThreshold,
-				IPRate:          newDestinationRate,
-				IPRateThreshold: config.IPRateThreshold,
-				SrcIP:           &config.context.srcIP,
-				DstIPs:          destinationLabels,
-				C2IP:            &config.context.c2IP,
-				SampleID:        config.context.sampleID,
-			}
+			return NewBehavior(
+				Scan,
+				Global,
+				eventTime,
+				globalPacketRate,
+				config.PacketRateThreshold,
+				newDestinationRate,
+				config.IPRateThreshold,
+				nil,
+				destinationLabels,
+				&config.context,
+			)
 		}
 	}
 
-	return &Behavior{
-		Classification:  Idle,
-		Scope:           Global,
-		Timestamp:       eventTime,
-		PacketRate:      globalPacketRate,
-		PacketThreshold: config.PacketRateThreshold,
-		IPRate:          newDestinationRate,
-		IPRateThreshold: config.IPRateThreshold,
-		SrcIP:           &config.context.srcIP,
-		DstIPs:          destinationLabels,
-		C2IP:            &config.context.c2IP,
-		SampleID:        config.context.sampleID,
-	}
+	return NewBehavior(
+		Idle,
+		Global,
+		eventTime,
+		globalPacketRate,
+		config.PacketRateThreshold,
+		newDestinationRate,
+		config.IPRateThreshold,
+		nil,
+		destinationLabels,
+		&config.context,
+	)
 }
 
 func destinationLabels(destinations map[Destination]int) *[]string {
