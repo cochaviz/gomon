@@ -93,6 +93,31 @@ func TestEveScanFormatting(t *testing.T) {
 	}
 }
 
+func TestOutboundSuppressedDuringScan(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfig(buf, 1, 2)
+
+	packets := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.11", 23),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.12", 80),
+	}
+
+	windowStart := time.Now()
+	config.ProcessBatch(nil, packets, windowStart)
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+
+	scan := findEventByCategory(events, "scan")
+	if scan == nil {
+		t.Fatalf("expected scan alert, got %v", events)
+	}
+	if conn := findEventByCategory(events, "connection"); conn != nil {
+		t.Fatalf("expected no outbound connection events during scan, got %v", conn)
+	}
+}
+
 func newTestAnalysisConfig(w io.Writer, packetThresh, ipThresh float64) *AnalysisConfiguration {
 	config := NewAnalysisConfiguration(
 		"10.0.0.5",
