@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/google/gopacket"
@@ -14,12 +15,14 @@ import (
 
 // == Analysis
 
+const defaultMaxDestinations = 1024
+
 type AnalysisConfiguration struct {
 	// configuration
 	PacketRateThreshold float64
 	IPRateThreshold     float64
 	Window              time.Duration
-	maxHosts            map[string]int // maximum number of hosts to analyze
+	maxDestinations     int // maximum number of destinations to analyze per window
 
 	// extra logging options
 	showIdle    bool // emit idle windows when requested
@@ -54,10 +57,10 @@ func (s AnalysisSummary) TotalAlerts() int {
 }
 
 type batchResult struct {
-	windowStart       time.Time
-	hostPacketCounts  map[string]int
-	globalPacketCount int
-	globalNewIPCount  int
+	windowStart               time.Time
+	destinationPacketCounts   map[Destination]int
+	globalPacketCount         int
+	globalNewDestinationCount int
 }
 
 type AnalysisContext struct {
@@ -148,6 +151,7 @@ func NewAnalysisConfiguration(
 			uninterestingIPs: filterIPs,
 		},
 		captureBehavior: captureBehavior,
+		maxDestinations: defaultMaxDestinations,
 	}
 }
 
@@ -185,8 +189,11 @@ type Behavior struct {
 	C2IP     *string `json:"c2_ip"`
 
 	// Destination IP/s depending on the scope
-	DstIPs *[]string `json:"dst_ips"`
-	DstIP  *string   `json:"dst_ip"`
+	DstIPs      *[]string    `json:"dst_ips"`
+	DstIP       *string      `json:"dst_ip"`
+	DstPort     *uint16      `json:"dst_port,omitempty"`
+	Proto       string       `json:"proto,omitempty"`
+	Destination *Destination `json:"destination,omitempty"`
 }
 
 // ProcessBatch processes a (subset) of a window of packets and saves
@@ -207,18 +214,21 @@ func (config *AnalysisConfiguration) ProcessBatch(
 		config.captureRecentPackets(batch)
 	}
 
-	const maxTrackedHosts = 512
-	globalPacketCount, localPacketCounts, err := countPacketsByHost(
+	maxTrackedDestinations := config.maxDestinations
+	if maxTrackedDestinations <= 0 {
+		maxTrackedDestinations = defaultMaxDestinations
+	}
+	globalPacketCount, destinationPacketCounts, err := countPacketsByDestination(
 		&batch,
 		&config.context.uninterestingIPs,
-		maxTrackedHosts,
+		maxTrackedDestinations,
 	)
 	if err != nil {
-		var maxErr *MaxHostsReached
+		var maxErr *MaxDestinationsReached
 		if errors.As(err, &maxErr) {
 			config.logger.Warn(
-				"Maximum number of hosts reached; continuing with partial counts",
-				"limit", maxTrackedHosts,
+				"Maximum number of destinations reached; continuing with partial counts",
+				"limit", maxTrackedDestinations,
 			)
 		} else {
 			config.logger.Error("Error counting packet totals", "error", err)
@@ -227,12 +237,12 @@ func (config *AnalysisConfiguration) ProcessBatch(
 
 	// Save intermediate results; normalization happens when the window flushes.
 	config.result.globalPacketCount += globalPacketCount
-	var newHostCount int
-	config.result.hostPacketCounts, newHostCount = mergeHostCounts(
-		config.result.hostPacketCounts,
-		localPacketCounts,
+	var newDestCount int
+	config.result.destinationPacketCounts, newDestCount = mergeDestinationCounts(
+		config.result.destinationPacketCounts,
+		destinationPacketCounts,
 	)
-	config.result.globalNewIPCount += newHostCount
+	config.result.globalNewDestinationCount += newDestCount
 }
 
 func (config *AnalysisConfiguration) captureRecentPackets(batch []gopacket.Packet) {
@@ -311,7 +321,7 @@ func (config *AnalysisConfiguration) snapshotHostPackets(host string) []gopacket
 }
 
 func (config *AnalysisConfiguration) flushResults() {
-	if config.result.globalPacketCount == 0 && len(config.result.hostPacketCounts) == 0 {
+	if config.result.globalPacketCount == 0 && len(config.result.destinationPacketCounts) == 0 {
 		return
 	}
 	if config.result.windowStart.IsZero() {
@@ -334,32 +344,43 @@ func (config *AnalysisConfiguration) flushResults() {
 		"windowEnd", windowEnd,
 		"windowSeconds", durationSeconds,
 		"globalPacketCount", config.result.globalPacketCount,
-		"hostPacketCounts", config.result.hostPacketCounts,
-		"globalNewIPCount", config.result.globalNewIPCount,
+		"destinationPacketCounts", config.result.destinationPacketCounts,
+		"globalNewDestinations", config.result.globalNewDestinationCount,
 	)
 
 	// first classify global behavior since it can be used by the local behavior
 	globalPacketRate := float64(config.result.globalPacketCount) / durationSeconds
-	globalIPRate := float64(config.result.globalNewIPCount) / durationSeconds
+	globalDestinationRate := float64(config.result.globalNewDestinationCount) / durationSeconds
+	destinations := destinationLabels(config.result.destinationPacketCounts)
 
 	globalBehavior := config.classifyGlobalBehavior(
 		globalPacketRate,
-		globalIPRate,
-		nil,
+		globalDestinationRate,
+		destinations,
 		config.result.windowStart,
 	)
 	config.logBehavior(globalBehavior, nil)
 
 	// then classify local behavior
-	for host, count := range config.result.hostPacketCounts {
+	capturedHosts := make(map[string]struct{})
+	for destination, count := range config.result.destinationPacketCounts {
 		packetRate := float64(count) / durationSeconds
-		localBehavior := config.classifyLocalBehavior(packetRate, host, config.result.windowStart, globalBehavior)
+		localBehavior := config.classifyLocalBehavior(packetRate, destination, config.result.windowStart, globalBehavior)
 		var captured []gopacket.Packet
+		var captureHost string
+		if localBehavior != nil && localBehavior.DstIP != nil {
+			captureHost = *localBehavior.DstIP
+		}
 
 		if capture, err := config.captureBehavior(config, localBehavior); err != nil {
 			config.logger.Error("Failed to capture packets", "error", err)
-		} else if capture {
-			captured = config.snapshotHostPackets(*localBehavior.DstIP)
+		} else if capture && captureHost != "" {
+			if _, seen := capturedHosts[captureHost]; seen {
+				config.logger.Debug("Skipping duplicate capture for host", "host", captureHost)
+			} else {
+				capturedHosts[captureHost] = struct{}{}
+				captured = config.snapshotHostPackets(captureHost)
+			}
 		}
 		config.logBehavior(localBehavior, captured)
 	}
@@ -447,19 +468,28 @@ func (config *AnalysisConfiguration) persistPackets(behavior *Behavior, packets 
 
 func (config *AnalysisConfiguration) classifyLocalBehavior(
 	packetRate float64,
-	destinationIP string,
+	destination Destination,
 	eventTime time.Time,
 	globalBehavior *Behavior,
 ) *Behavior {
+	destCopy := destination // avoid referencing loop variable
+	var dstPort *uint16
+	if destCopy.Port > 0 {
+		port := destCopy.Port
+		dstPort = &port
+	}
+
 	config.logger.Debug(
 		"Classifying local behavior",
 		"packetRate", packetRate,
 		"threshold", config.PacketRateThreshold,
-		"destinationIP", destinationIP,
+		"destination", destCopy.String(),
+		"protocol", destCopy.Protocol,
 	)
 
 	// attacks can only occur if a C2 IP is specified (assumed)
 	if config.context.c2IP != "" && packetRate > config.PacketRateThreshold {
+		destIP := destCopy.IP
 		return &Behavior{
 			Classification:  Attack,
 			Scope:           Local,
@@ -468,7 +498,10 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 			PacketThreshold: config.PacketRateThreshold,
 			IPRate:          0,
 			IPRateThreshold: 0,
-			DstIP:           &destinationIP,
+			DstIP:           &destIP,
+			DstPort:         dstPort,
+			Proto:           destCopy.Protocol,
+			Destination:     &destCopy,
 			SrcIP:           &config.context.srcIP,
 			SampleID:        config.context.sampleID,
 		}
@@ -478,6 +511,7 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 	if globalBehavior != nil && globalBehavior.Classification == Scan {
 		return nil
 	}
+	destIP := destCopy.IP
 	return &Behavior{
 		Classification:  OutboundConnection,
 		Scope:           Local,
@@ -486,7 +520,10 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 		PacketThreshold: config.PacketRateThreshold,
 		IPRate:          0,
 		IPRateThreshold: 0,
-		DstIP:           &destinationIP,
+		DstIP:           &destIP,
+		DstPort:         dstPort,
+		Proto:           destCopy.Protocol,
+		Destination:     &destCopy,
 		SrcIP:           &config.context.srcIP,
 		SampleID:        config.context.sampleID,
 	}
@@ -494,8 +531,8 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 
 func (config *AnalysisConfiguration) classifyGlobalBehavior(
 	globalPacketRate float64,
-	newIPRate float64,
-	destinationIPs *[]string,
+	newDestinationRate float64,
+	destinationLabels *[]string,
 	eventTime time.Time,
 ) *Behavior {
 	// found an anomalous activity
@@ -509,12 +546,12 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 		)
 
 		// detected a scan
-		if newIPRate > config.IPRateThreshold {
+		if newDestinationRate > config.IPRateThreshold {
 			config.logger.Debug(
-				"Detected high new IP rate",
+				"Detected high new destination rate",
 				"scope", Global,
 				"eventTime", eventTime,
-				"newIPRate", newIPRate,
+				"newIPRate", newDestinationRate,
 				"threshold", config.IPRateThreshold,
 			)
 
@@ -524,10 +561,10 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 				Timestamp:       eventTime,
 				PacketRate:      globalPacketRate,
 				PacketThreshold: config.PacketRateThreshold,
-				IPRate:          newIPRate,
+				IPRate:          newDestinationRate,
 				IPRateThreshold: config.IPRateThreshold,
 				SrcIP:           &config.context.srcIP,
-				DstIPs:          destinationIPs,
+				DstIPs:          destinationLabels,
 				C2IP:            &config.context.c2IP,
 				SampleID:        config.context.sampleID,
 			}
@@ -540,13 +577,35 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 		Timestamp:       eventTime,
 		PacketRate:      globalPacketRate,
 		PacketThreshold: config.PacketRateThreshold,
-		IPRate:          newIPRate,
+		IPRate:          newDestinationRate,
 		IPRateThreshold: config.IPRateThreshold,
 		SrcIP:           &config.context.srcIP,
-		DstIPs:          destinationIPs,
+		DstIPs:          destinationLabels,
 		C2IP:            &config.context.c2IP,
 		SampleID:        config.context.sampleID,
 	}
+}
+
+func destinationLabels(destinations map[Destination]int) *[]string {
+	if len(destinations) == 0 {
+		return nil
+	}
+
+	labels := make([]string, 0, len(destinations))
+	for destination := range destinations {
+		label := destination.String()
+		if label == "" {
+			continue
+		}
+		labels = append(labels, label)
+	}
+
+	if len(labels) == 0 {
+		return nil
+	}
+
+	sort.Strings(labels)
+	return &labels
 }
 
 func (config *AnalysisConfiguration) Close() error {

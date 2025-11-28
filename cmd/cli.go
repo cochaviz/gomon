@@ -57,7 +57,7 @@ func init() {
 		&uniqueIPRateThreshold,
 		"ip-threshold",
 		defaultUniqueIPRateThresh,
-		"Destination IP diversity threshold per window before flagging a scan.",
+		"Destination endpoint (IP/port/protocol) diversity threshold per window before flagging a scan.",
 	)
 	RootCmd.Flags().StringVar(
 		&logLevelStr,

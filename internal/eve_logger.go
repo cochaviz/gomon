@@ -2,6 +2,7 @@ package internal
 
 import (
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"sync"
@@ -23,6 +24,8 @@ type EveEvent struct {
 	Host      string         `json:"host,omitempty"`
 	SrcIP     string         `json:"src_ip,omitempty"`
 	DestIP    string         `json:"dest_ip,omitempty"`
+	DestPort  uint16         `json:"dest_port,omitempty"`
+	Proto     string         `json:"proto,omitempty"`
 	FlowID    uint64         `json:"flow_id,omitempty"`
 	Alert     *EveAlert      `json:"alert,omitempty"`
 	Stats     *EveStats      `json:"stats,omitempty"`
@@ -58,6 +61,8 @@ type EveDetails struct {
 	PacketThreshold float64       `json:"packet_threshold,omitempty"`
 	IPRate          float64       `json:"ip_rate,omitempty"`
 	IPRateThreshold float64       `json:"ip_rate_threshold,omitempty"`
+	DestPort        *uint16       `json:"dest_port,omitempty"`
+	Proto           string        `json:"proto,omitempty"`
 }
 
 func NewEveLogger(w io.Writer) *EveLogger {
@@ -128,6 +133,13 @@ func behaviorToEveEvent(behavior *Behavior) *EveEvent {
 		event.DestIP = "0.0.0.0"
 	}
 
+	if behavior.DstPort != nil {
+		event.DestPort = *behavior.DstPort
+	}
+	if behavior.Proto != "" {
+		event.Proto = behavior.Proto
+	}
+
 	return event
 }
 
@@ -185,6 +197,8 @@ func newEveDetails(behavior *Behavior) *EveDetails {
 		PacketThreshold: behavior.PacketThreshold,
 		IPRate:          behavior.IPRate,
 		IPRateThreshold: behavior.IPRateThreshold,
+		DestPort:        behavior.DstPort,
+		Proto:           behavior.Proto,
 	}
 
 	return d
@@ -278,6 +292,12 @@ func flowIDFromBehavior(behavior *Behavior) uint64 {
 	}
 	if behavior.DstIP != nil {
 		add(*behavior.DstIP)
+	}
+	if behavior.DstPort != nil {
+		add(fmt.Sprintf("%d", *behavior.DstPort))
+	}
+	if behavior.Proto != "" {
+		add(behavior.Proto)
 	}
 	if behavior.DstIPs != nil {
 		for _, ip := range *behavior.DstIPs {

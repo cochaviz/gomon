@@ -1,15 +1,37 @@
 package internal
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 )
 
-type MaxHostsReached struct{}
+type MaxDestinationsReached struct{}
 
-func (e *MaxHostsReached) Error() string {
-	return "maximum number of hosts reached"
+func (e *MaxDestinationsReached) Error() string {
+	return "maximum number of destinations reached"
+}
+
+// Destination identifies a remote endpoint using IP, port, and protocol.
+type Destination struct {
+	IP       string `json:"ip"`
+	Port     uint16 `json:"port,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
+}
+
+// String renders a human-readable endpoint label.
+func (d Destination) String() string {
+	base := d.IP
+	if d.Port > 0 {
+		base = fmt.Sprintf("%s:%d", base, d.Port)
+	}
+	if d.Protocol != "" {
+		return fmt.Sprintf("%s/%s", base, strings.ToLower(d.Protocol))
+	}
+	return base
 }
 
 type packetRing struct {
@@ -48,41 +70,41 @@ func (r *packetRing) snapshot() []gopacket.Packet {
 	return out
 }
 
-func mergeHostCounts(acc map[string]int, batch map[string]int) (map[string]int, int) {
+func mergeDestinationCounts(acc map[Destination]int, batch map[Destination]int) (map[Destination]int, int) {
 	if len(batch) == 0 {
 		return acc, 0
 	}
 
 	if acc == nil {
-		acc = make(map[string]int, len(batch))
+		acc = make(map[Destination]int, len(batch))
 	}
 
-	newHosts := 0
+	newDestinations := 0
 
-	for host, count := range batch {
+	for destination, count := range batch {
 		if count == 0 {
 			continue
 		}
-		if _, exists := acc[host]; !exists {
-			newHosts++
+		if _, exists := acc[destination]; !exists {
+			newDestinations++
 		}
-		acc[host] += count
+		acc[destination] += count
 	}
 
-	return acc, newHosts
+	return acc, newDestinations
 }
 
-// countPacketsByHost tallies packets overall and per destination host.
-func countPacketsByHost(
+// countPacketsByDestination tallies packets overall and per destination endpoint.
+func countPacketsByDestination(
 	pkts *[]gopacket.Packet,
 	excludeIPs *[]string,
-	maxHosts int,
-) (int, map[string]int, error) {
+	maxDestinations int,
+) (int, map[Destination]int, error) {
 	if pkts == nil || len(*pkts) == 0 {
 		return 0, nil, nil
 	}
 
-	hostCounts := make(map[string]int, maxHosts)
+	hostCounts := make(map[Destination]int, maxDestinations)
 	total := 0
 
 	var exclude map[string]struct{}
@@ -100,27 +122,59 @@ func countPacketsByHost(
 		if packet == nil {
 			continue
 		}
-		networkLayer := packet.NetworkLayer()
-		if networkLayer == nil {
+		destination := destinationFromPacket(packet)
+		if destination.IP == "" {
 			continue
 		}
 
-		dst := networkLayer.NetworkFlow().Dst().String()
-
-		if _, skip := exclude[dst]; skip {
+		if _, skip := exclude[destination.IP]; skip {
 			continue
 		}
 
 		total++
 
-		if len(hostCounts) < maxHosts || hostCounts[dst] > 0 {
-			hostCounts[dst]++
+		if len(hostCounts) < maxDestinations || hostCounts[destination] > 0 {
+			hostCounts[destination]++
 		} else {
-			return total, hostCounts, &MaxHostsReached{}
+			return total, hostCounts, &MaxDestinationsReached{}
 		}
 	}
 
 	return total, hostCounts, nil
+}
+
+func destinationFromPacket(packet gopacket.Packet) Destination {
+	var out Destination
+	if packet == nil {
+		return out
+	}
+
+	if network := packet.NetworkLayer(); network != nil {
+		out.IP = network.NetworkFlow().Dst().String()
+		if out.Protocol == "" {
+			out.Protocol = strings.ToLower(network.LayerType().String())
+		}
+	}
+
+	if transport := packet.TransportLayer(); transport != nil {
+		switch layer := transport.(type) {
+		case *layers.TCP:
+			out.Port = uint16(layer.DstPort)
+			out.Protocol = "tcp"
+		case *layers.UDP:
+			out.Port = uint16(layer.DstPort)
+			out.Protocol = "udp"
+		case *layers.SCTP:
+			out.Port = uint16(layer.DstPort)
+			out.Protocol = "sctp"
+		default:
+			if out.Protocol == "" {
+				out.Protocol = strings.ToLower(transport.LayerType().String())
+			}
+		}
+	}
+
+	return out
 }
 
 // getEventTime returns the timestamp of the start of the window, or of the
