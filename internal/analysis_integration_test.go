@@ -16,7 +16,7 @@ import (
 
 func TestEveAttackFormatting(t *testing.T) {
 	buf := &bytes.Buffer{}
-	config := newTestAnalysisConfig(buf, 1, 10)
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 10)
 
 	packets := []gopacket.Packet{
 		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 8080),
@@ -58,7 +58,7 @@ func TestEveAttackFormatting(t *testing.T) {
 
 func TestEveScanFormatting(t *testing.T) {
 	buf := &bytes.Buffer{}
-	config := newTestAnalysisConfig(buf, 1, 3)
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 3)
 
 	packets := []gopacket.Packet{
 		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.1", 23),
@@ -95,7 +95,7 @@ func TestEveScanFormatting(t *testing.T) {
 
 func TestOutboundSuppressedDuringScan(t *testing.T) {
 	buf := &bytes.Buffer{}
-	config := newTestAnalysisConfig(buf, 1, 2)
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 2)
 
 	packets := []gopacket.Packet{
 		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 22),
@@ -120,7 +120,7 @@ func TestOutboundSuppressedDuringScan(t *testing.T) {
 
 func TestAttackDestinationNotLoggedAsOutbound(t *testing.T) {
 	buf := &bytes.Buffer{}
-	config := newTestAnalysisConfig(buf, 1, 10)
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 10)
 
 	packets := []gopacket.Packet{
 		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.20", 9001),
@@ -150,10 +150,77 @@ func TestAttackDestinationNotLoggedAsOutbound(t *testing.T) {
 	}
 }
 
-func newTestAnalysisConfig(w io.Writer, packetThresh, ipThresh float64) *AnalysisConfiguration {
+func TestSingleDestinationBurstDoesNotTriggerScan(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 3)
+
+	packets := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 22),
+	}
+
+	config.ProcessBatch(nil, packets, time.Now())
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	if scan := findEventByCategory(events, "scan"); scan != nil {
+		t.Fatalf("unexpected scan alert for single destination: %#v", scan)
+	}
+	if attack := findEventByCategory(events, "attack"); attack == nil {
+		t.Fatalf("expected attack alert for single destination burst, got %v", events)
+	}
+}
+
+func TestScanEmittedWithoutC2(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "", 1, 2)
+
+	packets := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.1", 80),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.2", 81),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.3", 82),
+	}
+
+	config.ProcessBatch(nil, packets, time.Now())
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	if scan := findEventByCategory(events, "scan"); scan == nil {
+		t.Fatalf("expected scan alert without C2 configured, got %v", events)
+	}
+	if attack := findEventByCategory(events, "attack"); attack != nil {
+		t.Fatalf("did not expect attack alert without C2, got %#v", attack)
+	}
+}
+
+func TestMultiPortSingleHostTriggersScan(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "", 1, 2)
+
+	packets := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.200", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.200", 23),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.200", 24),
+	}
+
+	config.ProcessBatch(nil, packets, time.Now())
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	if scan := findEventByCategory(events, "scan"); scan == nil {
+		t.Fatalf("expected scan alert for multi-port single host, got %v", events)
+	}
+	if attack := findEventByCategory(events, "attack"); attack != nil {
+		t.Fatalf("did not expect attack alert for multi-port scan, got %#v", attack)
+	}
+}
+
+func newTestAnalysisConfigWithC2(w io.Writer, c2 string, packetThresh, ipThresh float64) *AnalysisConfiguration {
 	config := NewAnalysisConfiguration(
 		"10.0.0.5",
-		"203.0.113.50",
+		c2,
 		nil,
 		false,
 		time.Second,
