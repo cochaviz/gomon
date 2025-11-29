@@ -118,6 +118,38 @@ func TestOutboundSuppressedDuringScan(t *testing.T) {
 	}
 }
 
+func TestAttackDestinationNotLoggedAsOutbound(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfig(buf, 1, 10)
+
+	packets := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.20", 9001),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.20", 9001),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.20", 9001),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.30", 443),
+	}
+
+	windowStart := time.Now()
+	config.ProcessBatch(nil, packets, windowStart)
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+
+	attack := findEventByCategory(events, "attack")
+	if attack == nil {
+		t.Fatalf("expected attack alert, got %v", events)
+	}
+	connections := findEventsByCategory(events, "connection")
+	if len(connections) == 0 {
+		t.Fatalf("expected outbound connection event for non-attack destination, got %v", events)
+	}
+	for _, conn := range connections {
+		if conn.DestIP == attack.DestIP && conn.DestPort == attack.DestPort {
+			t.Fatalf("attack destination %s:%d also logged as outbound connection: %#v", conn.DestIP, conn.DestPort, conn)
+		}
+	}
+}
+
 func newTestAnalysisConfig(w io.Writer, packetThresh, ipThresh float64) *AnalysisConfiguration {
 	config := NewAnalysisConfiguration(
 		"10.0.0.5",
@@ -213,6 +245,16 @@ func findEventByCategory(events []parsedEveEvent, category string) *parsedEveEve
 		}
 	}
 	return nil
+}
+
+func findEventsByCategory(events []parsedEveEvent, category string) []parsedEveEvent {
+	var matches []parsedEveEvent
+	for _, ev := range events {
+		if ev.Alert != nil && ev.Alert.Category == category {
+			matches = append(matches, ev)
+		}
+	}
+	return matches
 }
 
 func buildTestPacket(t *testing.T, proto layers.IPProtocol, dstIP string, dstPort uint16) gopacket.Packet {
