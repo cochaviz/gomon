@@ -118,6 +118,33 @@ func TestOutboundSuppressedDuringScan(t *testing.T) {
 	}
 }
 
+func TestScanEmittedWhenDestinationRateExceedsWithoutPacketRate(t *testing.T) {
+	buf := &bytes.Buffer{}
+	// Packet threshold is intentionally high so only the destination-rate condition can trigger a scan.
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 100, 2)
+
+	packets := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.30", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.31", 23),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.32", 80),
+	}
+
+	config.ProcessBatch(nil, packets, time.Now())
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+
+	if scan := findEventByCategory(events, "scan"); scan == nil {
+		t.Fatalf("expected scan alert when destination rate exceeded, got %v", events)
+	}
+	if conn := findEventByCategory(events, "connection"); conn != nil {
+		t.Fatalf("expected no outbound connection events during scan, got %v", conn)
+	}
+	if attack := findEventByCategory(events, "attack"); attack != nil {
+		t.Fatalf("did not expect attack alert when packet rate below threshold, got %#v", attack)
+	}
+}
+
 func TestAttackDestinationNotLoggedAsOutbound(t *testing.T) {
 	buf := &bytes.Buffer{}
 	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 10)

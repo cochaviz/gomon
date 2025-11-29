@@ -559,23 +559,22 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 			&config.context,
 		)
 	}
-	// if no c2 is specified, or it's a low packet rate, it might be a regular connection
-	// if, however, globally a scan was detected, we cannot determine whether it's part of the scan or not
-	if globalBehavior != nil && globalBehavior.Classification == Scan {
-		return nil
+	// it might be a regular connection if there is no scan
+	if globalBehavior == nil || globalBehavior.Classification != Scan {
+		return NewBehavior(
+			OutboundConnection,
+			Local,
+			eventTime,
+			packetRate,
+			config.PacketRateThreshold,
+			0,
+			0,
+			&destCopy,
+			nil,
+			&config.context,
+		)
 	}
-	return NewBehavior(
-		OutboundConnection,
-		Local,
-		eventTime,
-		packetRate,
-		config.PacketRateThreshold,
-		0,
-		0,
-		&destCopy,
-		nil,
-		&config.context,
-	)
+	return nil
 }
 
 func (config *AnalysisConfiguration) classifyGlobalBehavior(
@@ -584,7 +583,6 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 	destinationLabels *[]string,
 	eventTime time.Time,
 ) *Behavior {
-	// found an anomalous activity
 	if globalPacketRate > config.PacketRateThreshold {
 		config.logger.Debug(
 			"Detected global high packet rate",
@@ -593,30 +591,31 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 			"packetRate", globalPacketRate,
 			"threshold", config.PacketRateThreshold,
 		)
+	}
 
-		// detected a scan
-		if newDestinationRate > config.IPRateThreshold {
-			config.logger.Debug(
-				"Detected high new destination rate",
-				"scope", Global,
-				"eventTime", eventTime,
-				"newIPRate", newDestinationRate,
-				"threshold", config.IPRateThreshold,
-			)
+	// detected a scan when the new destination rate exceeds the configured threshold,
+	// regardless of whether the packet-rate condition was satisfied
+	if newDestinationRate > config.IPRateThreshold {
+		config.logger.Debug(
+			"Detected high new destination rate",
+			"scope", Global,
+			"eventTime", eventTime,
+			"newIPRate", newDestinationRate,
+			"threshold", config.IPRateThreshold,
+		)
 
-			return NewBehavior(
-				Scan,
-				Global,
-				eventTime,
-				globalPacketRate,
-				config.PacketRateThreshold,
-				newDestinationRate,
-				config.IPRateThreshold,
-				nil,
-				destinationLabels,
-				&config.context,
-			)
-		}
+		return NewBehavior(
+			Scan,
+			Global,
+			eventTime,
+			globalPacketRate,
+			config.PacketRateThreshold,
+			newDestinationRate,
+			config.IPRateThreshold,
+			nil,
+			destinationLabels,
+			&config.context,
+		)
 	}
 
 	return NewBehavior(
