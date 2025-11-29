@@ -145,6 +145,38 @@ func TestScanEmittedWhenDestinationRateExceedsWithoutPacketRate(t *testing.T) {
 	}
 }
 
+func TestOutboundResumesAfterScanWindow(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 100, 2)
+
+	now := time.Now()
+
+	// Window 1: high destination diversity triggers scan, suppressing outbound.
+	scanPkts := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.40", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.41", 80),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.42", 443),
+	}
+	config.ProcessBatch(nil, scanPkts, now)
+	config.flushResults()
+
+	// Window 2: normal traffic below thresholds should log outbound connection.
+	connPkts := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.40", 22),
+	}
+	config.ProcessBatch(nil, connPkts, now.Add(time.Second))
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+
+	if scan := findEventByCategory(events, "scan"); scan == nil {
+		t.Fatalf("expected scan alert in first window, got %v", events)
+	}
+	if conn := findEventByCategory(events, "connection"); conn == nil {
+		t.Fatalf("expected outbound connection event in second window, got %v", events)
+	}
+}
+
 func TestAttackDestinationNotLoggedAsOutbound(t *testing.T) {
 	buf := &bytes.Buffer{}
 	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 10)
