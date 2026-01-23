@@ -195,7 +195,7 @@ func executeAnalysis(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	scanMode, err := parseScanDetectionMode(scanDetectionMode)
+	scanMode, err := internal.ParseScanDetectionMode(scanDetectionMode)
 	if err != nil {
 		return err
 	}
@@ -260,25 +260,6 @@ func parseLogLevel(level string) (slog.Level, error) {
 		return slog.LevelError, nil
 	default:
 		return slog.LevelInfo, fmt.Errorf("unsupported log-level %q (expected debug, info, warn, error)", level)
-	}
-}
-
-func parseScanDetectionMode(mode string) (internal.ScanDetectionMode, error) {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case string(internal.ScanDetectionHostRate):
-		return internal.ScanDetectionHostRate, nil
-	case string(internal.ScanDetectionNewHostRate):
-		return internal.ScanDetectionNewHostRate, nil
-	case string(internal.ScanDetectionFilteredHostRate):
-		return internal.ScanDetectionFilteredHostRate, nil
-	default:
-		return internal.ScanDetectionFilteredHostRate, fmt.Errorf(
-			"unsupported scan-detection-mode %q (expected %q, %q, or %q)",
-			mode,
-			internal.ScanDetectionHostRate,
-			internal.ScanDetectionNewHostRate,
-			internal.ScanDetectionFilteredHostRate,
-		)
 	}
 }
 

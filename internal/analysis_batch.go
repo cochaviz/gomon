@@ -2,11 +2,13 @@ package internal
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/gopacket"
@@ -58,13 +60,49 @@ func (s AnalysisSummary) TotalAlerts() int {
 	return s.AttackEvents + s.ScanEvents
 }
 
-type ScanDetectionMode string
+type ScanDetectionMode uint8
 
 const (
-	ScanDetectionHostRate         ScanDetectionMode = "host-rate"
-	ScanDetectionNewHostRate      ScanDetectionMode = "new-host-rate"
-	ScanDetectionFilteredHostRate ScanDetectionMode = "filtered-host-rate"
+	ScanDetectionFilteredHostRate ScanDetectionMode = iota
+	ScanDetectionHostRate
+	ScanDetectionNewHostRate
 )
+
+const (
+	scanDetectionFilteredHostRateLabel = "filtered-host-rate"
+	scanDetectionHostRateLabel         = "host-rate"
+	scanDetectionNewHostRateLabel      = "new-host-rate"
+)
+
+func (mode ScanDetectionMode) String() string {
+	switch mode {
+	case ScanDetectionHostRate:
+		return scanDetectionHostRateLabel
+	case ScanDetectionNewHostRate:
+		return scanDetectionNewHostRateLabel
+	default:
+		return scanDetectionFilteredHostRateLabel
+	}
+}
+
+func ParseScanDetectionMode(value string) (ScanDetectionMode, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", scanDetectionFilteredHostRateLabel:
+		return ScanDetectionFilteredHostRate, nil
+	case scanDetectionHostRateLabel:
+		return ScanDetectionHostRate, nil
+	case scanDetectionNewHostRateLabel:
+		return ScanDetectionNewHostRate, nil
+	default:
+		return ScanDetectionFilteredHostRate, fmt.Errorf(
+			"unsupported scan-detection-mode %q (expected %q, %q, or %q)",
+			value,
+			scanDetectionHostRateLabel,
+			scanDetectionNewHostRateLabel,
+			scanDetectionFilteredHostRateLabel,
+		)
+	}
+}
 
 type batchResult struct {
 	windowStart             time.Time
@@ -140,10 +178,6 @@ func NewAnalysisConfiguration(
 
 	if captureBehavior == nil {
 		captureBehavior = defaultCaptureBehavior
-	}
-
-	if scanDetectionMode == "" {
-		scanDetectionMode = ScanDetectionFilteredHostRate
 	}
 
 	return &AnalysisConfiguration{
@@ -416,14 +450,24 @@ func (config *AnalysisConfiguration) flushResults() {
 	windowEnd := config.result.windowStart.Add(windowDuration)
 
 	mode := config.scanDetectionMode
-	if mode == "" {
-		mode = ScanDetectionFilteredHostRate
-		config.scanDetectionMode = mode
+
+	localBehaviors := make([]*Behavior, 0, len(config.result.destinationPacketCounts))
+	attackHosts := make(map[string]struct{})
+	for _, entry := range config.result.destinationPacketCounts {
+		packetRate := float64(entry.Count) / durationSeconds
+		localBehavior := config.classifyLocalBehavior(packetRate, entry.Destination, config.result.windowStart)
+		if localBehavior == nil {
+			continue
+		}
+		localBehaviors = append(localBehaviors, localBehavior)
+		if localBehavior.Classification == Attack && localBehavior.DstIP != nil {
+			attackHosts[*localBehavior.DstIP] = struct{}{}
+		}
 	}
 
 	scanCounts := config.result.destinationPacketCounts
 	if mode == ScanDetectionFilteredHostRate {
-		scanCounts = config.filterNonAttackingDestinations(durationSeconds, scanCounts)
+		scanCounts = config.filterNonAttackingDestinations(scanCounts, attackHosts)
 	}
 	scanDestinations := destinationsFromCounts(scanCounts)
 	scanHosts := uniqueHosts(scanDestinations)
@@ -442,11 +486,12 @@ func (config *AnalysisConfiguration) flushResults() {
 		"destinationPacketCounts", config.result.destinationPacketCounts,
 		"windowDestinationCount", len(config.result.destinationPacketCounts),
 		"scanDetectionMode", mode,
+		"attackHostCount", len(attackHosts),
 		"scanHostCount", len(scanHosts),
 		"scanTargetCount", len(scanTargets),
 	)
 
-	// first classify global behavior since it can be used by the local behavior
+	// classify global behavior using local attack results
 	globalPacketRate := float64(config.result.globalPacketCount) / durationSeconds
 	scanRate := computeScanRate(durationSeconds, len(scanTargets))
 	scanLabels := hostLabels(scanTargets)
@@ -459,11 +504,12 @@ func (config *AnalysisConfiguration) flushResults() {
 	)
 	config.logBehavior(globalBehavior, nil)
 
-	// then classify local behavior
+	// then log local behavior
 	capturedHosts := make(map[string]struct{})
-	for _, entry := range config.result.destinationPacketCounts {
-		packetRate := float64(entry.Count) / durationSeconds
-		localBehavior := config.classifyLocalBehavior(packetRate, entry.Destination, config.result.windowStart, globalBehavior)
+	for _, localBehavior := range localBehaviors {
+		if !config.shouldLogLocalBehavior(globalBehavior, localBehavior) {
+			continue
+		}
 		var captured []gopacket.Packet
 		var captureHost string
 		if localBehavior != nil && localBehavior.DstIP != nil {
@@ -580,7 +626,6 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 	packetRate float64,
 	destination Destination,
 	eventTime time.Time,
-	globalBehavior *Behavior,
 ) *Behavior {
 	destCopy := destination // avoid referencing loop variable
 
@@ -593,7 +638,7 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 	)
 
 	// attacks can only occur if a C2 IP is specified (assumed)
-	if config.isAttackingRate(packetRate) {
+	if config != nil && config.context.c2IP != "" && packetRate > config.PacketRateThreshold {
 		return NewBehavior(
 			Attack,
 			Local,
@@ -607,26 +652,28 @@ func (config *AnalysisConfiguration) classifyLocalBehavior(
 			&config.context,
 		)
 	}
-	// it might be a regular connection if there is no scan
-	if globalBehavior == nil || globalBehavior.Classification != Scan {
-		return NewBehavior(
-			OutboundConnection,
-			Local,
-			eventTime,
-			packetRate,
-			config.PacketRateThreshold,
-			0,
-			0,
-			&destCopy,
-			nil,
-			&config.context,
-		)
-	}
-	return nil
+	return NewBehavior(
+		OutboundConnection,
+		Local,
+		eventTime,
+		packetRate,
+		config.PacketRateThreshold,
+		0,
+		0,
+		&destCopy,
+		nil,
+		&config.context,
+	)
 }
 
-func (config *AnalysisConfiguration) isAttackingRate(packetRate float64) bool {
-	return config != nil && config.context.c2IP != "" && packetRate > config.PacketRateThreshold
+func (config *AnalysisConfiguration) shouldLogLocalBehavior(globalBehavior *Behavior, localBehavior *Behavior) bool {
+	if localBehavior == nil {
+		return false
+	}
+	if globalBehavior == nil {
+		return true
+	}
+	return !(globalBehavior.Classification == Scan && localBehavior.Classification == OutboundConnection)
 }
 
 func (config *AnalysisConfiguration) classifyGlobalBehavior(
@@ -685,21 +732,20 @@ func (config *AnalysisConfiguration) classifyGlobalBehavior(
 	)
 }
 
-func (config *AnalysisConfiguration) filterNonAttackingDestinations(durationSeconds float64, destinations destinationCounts) destinationCounts {
-	if config == nil || durationSeconds <= 0 || len(destinations) == 0 {
+func (config *AnalysisConfiguration) filterNonAttackingDestinations(destinations destinationCounts, attackHosts map[string]struct{}) destinationCounts {
+	if len(destinations) == 0 {
 		return nil
 	}
-	if config.context.c2IP == "" {
+	if len(attackHosts) == 0 {
 		return destinations
 	}
 
 	filtered := make(destinationCounts, len(destinations))
 	for key, entry := range destinations {
-		if entry.Count == 0 {
+		if entry.Destination.IP == "" {
 			continue
 		}
-		packetRate := float64(entry.Count) / durationSeconds
-		if config.isAttackingRate(packetRate) {
+		if _, isAttackHost := attackHosts[entry.Destination.IP]; isAttackHost {
 			continue
 		}
 		filtered[key] = entry
