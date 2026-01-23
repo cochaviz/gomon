@@ -22,6 +22,16 @@ type Destination struct {
 	Protocol string `json:"protocol,omitempty"`
 }
 
+// Equals returns true when the destinations match by IP and port.
+func (d Destination) Equals(other Destination) bool {
+	return d.IP == other.IP && d.Port == other.Port
+}
+
+// HostEquals returns true when the destinations share the same host IP.
+func (d Destination) HostEquals(other Destination) bool {
+	return d.IP == other.IP
+}
+
 // String renders a human-readable endpoint label.
 func (d Destination) String() string {
 	base := d.IP
@@ -33,6 +43,22 @@ func (d Destination) String() string {
 	}
 	return base
 }
+
+type destinationKey struct {
+	IP   string
+	Port uint16
+}
+
+func destinationKeyFor(destination Destination) destinationKey {
+	return destinationKey{IP: destination.IP, Port: destination.Port}
+}
+
+type destinationCount struct {
+	Destination Destination
+	Count       int
+}
+
+type destinationCounts map[destinationKey]destinationCount
 
 type packetRing struct {
 	max   int
@@ -70,28 +96,31 @@ func (r *packetRing) snapshot() []gopacket.Packet {
 	return out
 }
 
-func mergeDestinationCounts(acc map[Destination]int, batch map[Destination]int) (map[Destination]int, int) {
+func mergeDestinationCounts(acc destinationCounts, batch destinationCounts) destinationCounts {
 	if len(batch) == 0 {
-		return acc, 0
+		return acc
 	}
 
 	if acc == nil {
-		acc = make(map[Destination]int, len(batch))
+		acc = make(destinationCounts, len(batch))
 	}
 
-	newDestinations := 0
-
-	for destination, count := range batch {
-		if count == 0 {
+	for key, entry := range batch {
+		if entry.Count == 0 {
 			continue
 		}
-		if _, exists := acc[destination]; !exists {
-			newDestinations++
+		if existing, exists := acc[key]; exists {
+			existing.Count += entry.Count
+			if existing.Destination.Protocol == "" && entry.Destination.Protocol != "" {
+				existing.Destination.Protocol = entry.Destination.Protocol
+			}
+			acc[key] = existing
+		} else {
+			acc[key] = entry
 		}
-		acc[destination] += count
 	}
 
-	return acc, newDestinations
+	return acc
 }
 
 // countPacketsByDestination tallies packets overall and per destination endpoint.
@@ -99,12 +128,12 @@ func countPacketsByDestination(
 	pkts *[]gopacket.Packet,
 	excludeIPs *[]string,
 	maxDestinations int,
-) (int, map[Destination]int, error) {
+) (int, destinationCounts, error) {
 	if pkts == nil || len(*pkts) == 0 {
 		return 0, nil, nil
 	}
 
-	hostCounts := make(map[Destination]int, maxDestinations)
+	hostCounts := make(destinationCounts, maxDestinations)
 	total := 0
 
 	var exclude map[string]struct{}
@@ -133,10 +162,23 @@ func countPacketsByDestination(
 
 		total++
 
-		if len(hostCounts) < maxDestinations || hostCounts[destination] > 0 {
-			hostCounts[destination]++
-		} else {
+		key := destinationKeyFor(destination)
+		if entry, exists := hostCounts[key]; exists {
+			entry.Count++
+			if entry.Destination.Protocol == "" && destination.Protocol != "" {
+				entry.Destination.Protocol = destination.Protocol
+			}
+			hostCounts[key] = entry
+			continue
+		}
+
+		if len(hostCounts) >= maxDestinations {
 			return total, hostCounts, &MaxDestinationsReached{}
+		}
+
+		hostCounts[key] = destinationCount{
+			Destination: destination,
+			Count:       1,
 		}
 	}
 

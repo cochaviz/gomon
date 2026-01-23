@@ -177,10 +177,10 @@ func TestOutboundResumesAfterScanWindow(t *testing.T) {
 	}
 }
 
-func TestNewDestinationRateOnlyCountsNewAcrossWindows(t *testing.T) {
+func TestNewHostRateOnlyCountsNewAcrossWindows(t *testing.T) {
 	buf := &bytes.Buffer{}
 	config := newTestAnalysisConfigWithC2(buf, "", 100, 2)
-	config.destinationRateMode = DestinationRateNew
+	config.scanDetectionMode = ScanDetectionNewHostRate
 
 	now := time.Now()
 
@@ -260,6 +260,32 @@ func TestSingleDestinationBurstDoesNotTriggerScan(t *testing.T) {
 	if attack := findEventByCategory(events, "attack"); attack == nil {
 		t.Fatalf("expected attack alert for single destination burst, got %v", events)
 	}
+
+}
+
+func TestScanIgnoresAttackDestinations(t *testing.T) {
+	buf := &bytes.Buffer{}
+	config := newTestAnalysisConfigWithC2(buf, "203.0.113.50", 1, 2)
+	config.scanDetectionMode = ScanDetectionFilteredHostRate
+
+	packets := []gopacket.Packet{
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.10", 22),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.20", 23),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.20", 23),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.30", 80),
+		buildTestPacket(t, layers.IPProtocolTCP, "198.51.100.30", 80),
+	}
+
+	config.ProcessBatch(nil, packets, time.Now())
+	config.flushResults()
+
+	events := parseEveEvents(t, buf.Bytes())
+	if scan := findEventByCategory(events, "scan"); scan != nil {
+		t.Fatalf("unexpected scan alert when only attack traffic exceeds host rate, got %#v", scan)
+	}
+	if attack := findEventByCategory(events, "attack"); attack == nil {
+		t.Fatalf("expected attack alert for high-rate destinations, got %v", events)
+	}
 }
 
 func TestScanEmittedWithoutC2(t *testing.T) {
@@ -284,7 +310,7 @@ func TestScanEmittedWithoutC2(t *testing.T) {
 	}
 }
 
-func TestMultiPortSingleHostTriggersScan(t *testing.T) {
+func TestMultiPortSingleHostDoesNotTriggerScan(t *testing.T) {
 	buf := &bytes.Buffer{}
 	config := newTestAnalysisConfigWithC2(buf, "", 1, 2)
 
@@ -298,11 +324,14 @@ func TestMultiPortSingleHostTriggersScan(t *testing.T) {
 	config.flushResults()
 
 	events := parseEveEvents(t, buf.Bytes())
-	if scan := findEventByCategory(events, "scan"); scan == nil {
-		t.Fatalf("expected scan alert for multi-port single host, got %v", events)
+	if scan := findEventByCategory(events, "scan"); scan != nil {
+		t.Fatalf("unexpected scan alert for multi-port single host, got %v", scan)
 	}
 	if attack := findEventByCategory(events, "attack"); attack != nil {
-		t.Fatalf("did not expect attack alert for multi-port scan, got %#v", attack)
+		t.Fatalf("did not expect attack alert for multi-port single host, got %#v", attack)
+	}
+	if conn := findEventByCategory(events, "connection"); conn == nil {
+		t.Fatalf("expected outbound connection event for multi-port single host, got %v", events)
 	}
 }
 
@@ -316,7 +345,7 @@ func newTestAnalysisConfigWithC2(w io.Writer, c2 string, packetThresh, destinati
 		"",
 		packetThresh,
 		destinationThresh,
-		DestinationRateTotal,
+		ScanDetectionFilteredHostRate,
 		slog.LevelError,
 		"sample-1",
 		0,

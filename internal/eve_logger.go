@@ -227,7 +227,7 @@ func signatureForBehavior(behavior *Behavior) string {
 	case Attack:
 		return "gomon high packet-rate to single host"
 	case Scan:
-		return "gomon destination scan volume exceeded"
+		return "gomon horizontal scan host-rate exceeded"
 	case OutboundConnection:
 		return "gomon outbound connection observed"
 	default:
