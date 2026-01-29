@@ -48,6 +48,7 @@ var (
 	eveLogPath               string
 	savePacketsCount         int
 	showVersionOnly          bool
+	calibrate                bool
 )
 
 var version = resolveVersion()
@@ -143,6 +144,12 @@ func init() {
 		false,
 		"Print the gomon version and exit.",
 	)
+	RootCmd.Flags().BoolVar(
+		&calibrate,
+		"calibrate",
+		false,
+		"Log calibration metrics without emitting classification events.",
+	)
 }
 
 var RootCmd = &cobra.Command{
@@ -217,6 +224,7 @@ func executeAnalysis(cmd *cobra.Command, args []string) error {
 		scanMode,
 		level,
 		sampleID,
+		calibrate,
 		savePacketsCount,
 		captureDirPath,
 		nil,
@@ -229,6 +237,11 @@ func executeAnalysis(cmd *cobra.Command, args []string) error {
 
 	if err := internal.CaptureLoop(handle, config); err != nil {
 		return fmt.Errorf("capture loop failed: %w", err)
+	}
+
+	if calibrate {
+		cmd.Println("Calibration complete. Alerts suppressed; see logs for per-window metrics.")
+		return nil
 	}
 
 	summary := config.Summary()
@@ -364,6 +377,7 @@ func renderRuntimeConfiguration(args []string) string {
 	fmt.Fprintf(&b, "  scan-detection-mode: %s\n", scanDetectionMode)
 	fmt.Fprintf(&b, "  log-level: %s\n", logLevelStr)
 	fmt.Fprintf(&b, "  show-idle: %t\n", showIdle)
+	fmt.Fprintf(&b, "  calibrate: %t\n", calibrate)
 	fmt.Fprintf(&b, "  c2-ip: %s\n", c2Display)
 	fmt.Fprintf(&b, "  sample-id: %s\n", sampleDisplay)
 	fmt.Fprintf(&b, "  ignore-dst: %s\n", ignoredDest)

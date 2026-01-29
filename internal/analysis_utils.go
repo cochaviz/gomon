@@ -60,6 +60,38 @@ type destinationCount struct {
 
 type destinationCounts map[destinationKey]destinationCount
 
+func topDestinationByCount(destinations destinationCounts) (Destination, int) {
+	if len(destinations) == 0 {
+		return Destination{}, 0
+	}
+
+	var (
+		maxDest  Destination
+		maxCount int
+		maxLabel string
+		found    bool
+	)
+
+	for _, entry := range destinations {
+		if entry.Count <= 0 {
+			continue
+		}
+		label := entry.Destination.String()
+		if !found || entry.Count > maxCount || (entry.Count == maxCount && label < maxLabel) {
+			maxCount = entry.Count
+			maxDest = entry.Destination
+			maxLabel = label
+			found = true
+		}
+	}
+
+	if !found {
+		return Destination{}, 0
+	}
+
+	return maxDest, maxCount
+}
+
 type packetRing struct {
 	max   int
 	items []gopacket.Packet

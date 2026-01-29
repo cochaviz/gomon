@@ -26,6 +26,7 @@ type AnalysisConfiguration struct {
 	Window                   time.Duration
 	scanDetectionMode        ScanDetectionMode
 	maxDestinations          int // maximum number of destinations to analyze per window
+	calibrate                bool
 
 	// extra logging options
 	showIdle    bool // emit idle windows when requested
@@ -47,6 +48,8 @@ type AnalysisConfiguration struct {
 
 	// static context for logging
 	context AnalysisContext
+
+	calibration calibrationStats
 }
 
 type AnalysisSummary struct {
@@ -118,6 +121,43 @@ type AnalysisContext struct {
 	uninterestingIPs []string // List of IP addresses that are not interesting for analysis
 }
 
+type calibrationStats struct {
+	windows       int
+	packetRateSum float64
+	packetRateMax float64
+	hostRateSum   float64
+	hostRateMax   float64
+}
+
+func (s *calibrationStats) update(packetRate float64, hostRate float64) {
+	if s == nil {
+		return
+	}
+	s.windows++
+	s.packetRateSum += packetRate
+	if packetRate > s.packetRateMax {
+		s.packetRateMax = packetRate
+	}
+	s.hostRateSum += hostRate
+	if hostRate > s.hostRateMax {
+		s.hostRateMax = hostRate
+	}
+}
+
+func (s *calibrationStats) packetRateAvg() float64 {
+	if s == nil || s.windows == 0 {
+		return 0
+	}
+	return s.packetRateSum / float64(s.windows)
+}
+
+func (s *calibrationStats) hostRateAvg() float64 {
+	if s == nil || s.windows == 0 {
+		return 0
+	}
+	return s.hostRateSum / float64(s.windows)
+}
+
 func NewAnalysisConfiguration(
 	srcIP string,
 	c2IP string,
@@ -130,6 +170,7 @@ func NewAnalysisConfiguration(
 	scanDetectionMode ScanDetectionMode,
 	level slog.Level,
 	sampleID string,
+	calibrate bool,
 	savePackets int,
 	captureDir string,
 	captureBehavior func(*AnalysisConfiguration, *Behavior) (bool, error),
@@ -188,6 +229,7 @@ func NewAnalysisConfiguration(
 		DestinationRateThreshold: destinationThreshold,
 		Window:                   window,
 		scanDetectionMode:        scanDetectionMode,
+		calibrate:                calibrate,
 		showIdle:                 showIdle,
 		savePackets:              savePackets,
 		captureDir:               captureDir,
@@ -449,7 +491,10 @@ func (config *AnalysisConfiguration) flushResults() {
 	durationSeconds := windowDuration.Seconds()
 	windowEnd := config.result.windowStart.Add(windowDuration)
 
-	mode := config.scanDetectionMode
+	if config.calibrate {
+		config.logCalibration(windowEnd, durationSeconds)
+		return
+	}
 
 	localBehaviors := make([]*Behavior, 0, len(config.result.destinationPacketCounts))
 	attackHosts := make(map[string]struct{})
@@ -466,13 +511,13 @@ func (config *AnalysisConfiguration) flushResults() {
 	}
 
 	scanCounts := config.result.destinationPacketCounts
-	if mode == ScanDetectionFilteredHostRate {
+	if config.scanDetectionMode == ScanDetectionFilteredHostRate {
 		scanCounts = config.filterNonAttackingDestinations(scanCounts, attackHosts)
 	}
 	scanDestinations := destinationsFromCounts(scanCounts)
 	scanHosts := uniqueHosts(scanDestinations)
 	scanTargets := scanHosts
-	if mode == ScanDetectionNewHostRate {
+	if config.scanDetectionMode == ScanDetectionNewHostRate {
 		scanTargets = newHosts(scanHosts, config.previousScanHosts)
 	}
 	config.previousScanHosts = scanHosts
@@ -485,7 +530,7 @@ func (config *AnalysisConfiguration) flushResults() {
 		"globalPacketCount", config.result.globalPacketCount,
 		"destinationPacketCounts", config.result.destinationPacketCounts,
 		"windowDestinationCount", len(config.result.destinationPacketCounts),
-		"scanDetectionMode", mode,
+		"scanDetectionMode", config.scanDetectionMode,
 		"attackHostCount", len(attackHosts),
 		"scanHostCount", len(scanHosts),
 		"scanTargetCount", len(scanTargets),
@@ -542,6 +587,95 @@ func (config *AnalysisConfiguration) resetWindowState() {
 		return
 	}
 	clear(config.buffers)
+}
+
+func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, durationSeconds float64) {
+	if config == nil {
+		return
+	}
+	if durationSeconds <= 0 {
+		durationSeconds = 1
+	}
+
+	globalPacketRate := float64(config.result.globalPacketCount) / durationSeconds
+	destinations := config.result.destinationPacketCounts
+
+	attackHosts := make(map[string]struct{})
+	if config.context.c2IP != "" && config.PacketRateThreshold > 0 {
+		for _, entry := range destinations {
+			if entry.Destination.IP == "" {
+				continue
+			}
+			packetRate := float64(entry.Count) / durationSeconds
+			if packetRate > config.PacketRateThreshold {
+				attackHosts[entry.Destination.IP] = struct{}{}
+			}
+		}
+	}
+
+	scanCounts := destinations
+	if config.scanDetectionMode == ScanDetectionFilteredHostRate {
+		scanCounts = config.filterNonAttackingDestinations(scanCounts, attackHosts)
+	}
+
+	scanHosts := uniqueHosts(destinationsFromCounts(scanCounts))
+	scanTargets := scanHosts
+	if config.scanDetectionMode == ScanDetectionNewHostRate {
+		scanTargets = newHosts(scanHosts, config.previousScanHosts)
+	}
+	config.previousScanHosts = scanHosts
+
+	scanRate := computeScanRate(durationSeconds, len(scanTargets))
+
+	topDestination, topCount := topDestinationByCount(destinations)
+	topRate := 0.0
+	if topCount > 0 {
+		topRate = float64(topCount) / durationSeconds
+	}
+	topLabel := "<none>"
+	if topCount > 0 {
+		topLabel = topDestination.String()
+	}
+
+	config.calibration.update(globalPacketRate, scanRate)
+
+	nullTestActivity := "idle"
+	if config.result.globalPacketCount > 0 {
+		nullTestActivity = "active"
+	}
+
+	args := []any{
+		"windowStart", config.result.windowStart,
+		"windowEnd", windowEnd,
+		"windowSeconds", durationSeconds,
+		"packetCount", config.result.globalPacketCount,
+		"destinationCount", len(destinations),
+		"scanTargetCount", len(scanTargets),
+		"scanDetectionMode", config.scanDetectionMode.String(),
+		"globalPacketRate", globalPacketRate,
+		"globalPacketRateAvg", config.calibration.packetRateAvg(),
+		"globalPacketRateMax", config.calibration.packetRateMax,
+		"hostRate", scanRate,
+		"hostRateAvg", config.calibration.hostRateAvg(),
+		"hostRateMax", config.calibration.hostRateMax,
+		"requiredPacketThreshold", topRate,
+		"requiredDestinationThreshold", scanRate,
+		"maxDestination", topLabel,
+		"maxDestinationPackets", topCount,
+		"maxDestinationRate", topRate,
+		"nullTestActivity", nullTestActivity,
+	}
+
+	if topCount > 0 {
+		args = append(
+			args,
+			"maxDestinationIP", topDestination.IP,
+			"maxDestinationPort", topDestination.Port,
+			"maxDestinationProto", topDestination.Protocol,
+		)
+	}
+
+	config.logger.Info("Calibration window", args...)
 }
 
 func (config *AnalysisConfiguration) logBehavior(

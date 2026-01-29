@@ -348,6 +348,7 @@ func newTestAnalysisConfigWithC2(w io.Writer, c2 string, packetThresh, destinati
 		ScanDetectionFilteredHostRate,
 		slog.LevelError,
 		"sample-1",
+		false,
 		0,
 		"",
 		nil,

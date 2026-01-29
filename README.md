@@ -9,6 +9,7 @@
 - Suricata Eve JSON output to stdout or a file, enriched with sample IDs, C2 hints, and per-window metrics.
 - Optional idle-window logging so you can correlate gaps in beaconing against sandbox state.
 - Packet capture artifact support: retain the last _N_ packets per destination whenever an alert fires.
+- Calibration mode to report per-window thresholds without emitting alerts.
 - Graceful signal handling and a final run summary with alert counts and artifact locations.
 - Built-in `--version` flag and runtime banner that show the binary tag or commit automatically (works with `go install module@version`).
 
@@ -74,6 +75,7 @@ At startup `gomon` prints an ASCII banner and a configuration block containing e
 | `--scan-detection-mode` | Scan detection mode: host-rate, new-host-rate, or filtered-host-rate. | `filtered-host-rate` |
 | `--log-level` | Logging verbosity (`debug`, `info`, `warn`, `error`). | `info` |
 | `--show-idle` | Emit idle window events instead of alerts only. | `false` |
+| `--calibrate` | Log per-window calibration metrics without emitting alerts. | `false` |
 | `--eve-log-path` | Write Eve JSON to this file instead of stdout. | _stdout_ |
 | `--capture-dir` | Directory for packet capture artifacts saved when alerts fire. | `./captures` |
 | `--save-packets` | Number of recent packets per host to persist for each alert. | `0` (disabled) |
