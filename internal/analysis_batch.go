@@ -122,14 +122,23 @@ type AnalysisContext struct {
 }
 
 type calibrationStats struct {
-	windows       int
-	packetRateSum float64
-	packetRateMax float64
-	hostRateSum   float64
-	hostRateMax   float64
+	windows                 int
+	packetRateSum           float64
+	packetRateMax           float64
+	hostRateSum             float64
+	hostRateMax             float64
+	topDestinationRateMax   float64
+	topDestinationCountMax  int
+	topDestinationCandidate Destination
 }
 
-func (s *calibrationStats) update(packetRate float64, hostRate float64) {
+func (s *calibrationStats) update(
+	packetRate float64,
+	hostRate float64,
+	topDestination Destination,
+	topCount int,
+	topRate float64,
+) {
 	if s == nil {
 		return
 	}
@@ -141,6 +150,20 @@ func (s *calibrationStats) update(packetRate float64, hostRate float64) {
 	s.hostRateSum += hostRate
 	if hostRate > s.hostRateMax {
 		s.hostRateMax = hostRate
+	}
+	if topRate > s.topDestinationRateMax {
+		s.topDestinationRateMax = topRate
+		s.topDestinationCountMax = topCount
+		s.topDestinationCandidate = topDestination
+		return
+	}
+	if topRate == s.topDestinationRateMax && topRate > 0 {
+		currentLabel := s.topDestinationCandidate.String()
+		candidateLabel := topDestination.String()
+		if currentLabel == "" || candidateLabel < currentLabel {
+			s.topDestinationCountMax = topCount
+			s.topDestinationCandidate = topDestination
+		}
 	}
 }
 
@@ -156,6 +179,19 @@ func (s *calibrationStats) hostRateAvg() float64 {
 		return 0
 	}
 	return s.hostRateSum / float64(s.windows)
+}
+
+type CalibrationSummary struct {
+	Windows                         int
+	PacketRateAvg                   float64
+	PacketRateMax                   float64
+	HostRateAvg                     float64
+	HostRateMax                     float64
+	RecommendedPacketThreshold      float64
+	RecommendedDestinationThreshold float64
+	MaxDestination                  Destination
+	MaxDestinationRate              float64
+	MaxDestinationPackets           int
 }
 
 func NewAnalysisConfiguration(
@@ -637,7 +673,7 @@ func (config *AnalysisConfiguration) logCalibration(windowEnd time.Time, duratio
 		topLabel = topDestination.String()
 	}
 
-	config.calibration.update(globalPacketRate, scanRate)
+	config.calibration.update(globalPacketRate, scanRate, topDestination, topCount, topRate)
 
 	nullTestActivity := "idle"
 	if config.result.globalPacketCount > 0 {
@@ -1013,6 +1049,26 @@ func (config *AnalysisConfiguration) Summary() AnalysisSummary {
 		return AnalysisSummary{}
 	}
 	return config.summary
+}
+
+func (config *AnalysisConfiguration) CalibrationSummary() CalibrationSummary {
+	if config == nil {
+		return CalibrationSummary{}
+	}
+
+	stats := config.calibration
+	return CalibrationSummary{
+		Windows:                         stats.windows,
+		PacketRateAvg:                   stats.packetRateAvg(),
+		PacketRateMax:                   stats.packetRateMax,
+		HostRateAvg:                     stats.hostRateAvg(),
+		HostRateMax:                     stats.hostRateMax,
+		RecommendedPacketThreshold:      stats.topDestinationRateMax,
+		RecommendedDestinationThreshold: stats.hostRateMax,
+		MaxDestination:                  stats.topDestinationCandidate,
+		MaxDestinationRate:              stats.topDestinationRateMax,
+		MaxDestinationPackets:           stats.topDestinationCountMax,
+	}
 }
 
 func defaultCaptureBehavior(config *AnalysisConfiguration, behavior *Behavior) (bool, error) {

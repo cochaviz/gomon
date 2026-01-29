@@ -240,7 +240,26 @@ func executeAnalysis(cmd *cobra.Command, args []string) error {
 	}
 
 	if calibrate {
+		summary := config.CalibrationSummary()
 		cmd.Println("Calibration complete. Alerts suppressed; see logs for per-window metrics.")
+		if summary.Windows == 0 {
+			cmd.Println("Calibration summary: no complete windows were processed.")
+			return nil
+		}
+		cmd.Printf("Calibration summary: %d window(s) analyzed\n", summary.Windows)
+		cmd.Printf(
+			"Recommended thresholds (based on max observed rates): packet-threshold >= %.4f, destination-threshold >= %.4f\n",
+			summary.RecommendedPacketThreshold,
+			summary.RecommendedDestinationThreshold,
+		)
+		if summary.MaxDestinationRate > 0 && summary.MaxDestination.IP != "" {
+			cmd.Printf(
+				"Top destination: %s (rate %.4f packets/s, %d packets)\n",
+				summary.MaxDestination.String(),
+				summary.MaxDestinationRate,
+				summary.MaxDestinationPackets,
+			)
+		}
 		return nil
 	}
 
